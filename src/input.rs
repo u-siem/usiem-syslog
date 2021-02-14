@@ -48,7 +48,7 @@ impl SiemComponent for SyslogInput {
         );
     }
 
-    fn set_storage(&mut self, conn: impl SiemComponentStateStorage) {}
+    fn set_storage(&mut self, _conn: impl SiemComponentStateStorage) {}
 
     fn run(&mut self) {
         let listener = match TcpListener::bind(&self.host[..]) {
@@ -82,7 +82,7 @@ impl SiemComponent for SyslogInput {
                     let kernel_sender = kernel_sender.clone();
                     thread::spawn(move || {
                         let mut buffer = [0; 9192];
-                        let origin = match SiemIp::from_ip_str(socket.ip().to_string()) {
+                        let origin = match SiemIp::from_ip_str(&socket.ip().to_string()[..]) {
                             Ok(v) => v,
                             Err(_) => {
                                 //Error parsing?? notify kernel and end thread connection
