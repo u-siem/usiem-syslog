@@ -1,6 +1,6 @@
 [package]
 name = "u-siem-syslog"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Samuel Garcés <samuel.garces@protonmail.com>"]
 license = "MIT"
 description = "Windows Server DNS parser for uSIEM"

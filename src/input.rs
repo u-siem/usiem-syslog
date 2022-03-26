@@ -6,25 +6,28 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use usiem::components::command::SiemCommandCall;
 use usiem::components::common::{
-    SiemComponentCapabilities, SiemComponentStateStorage, SiemFunctionCall, SiemMessage,
+    SiemComponentCapabilities, SiemComponentStateStorage, SiemMessage,
 };
 use usiem::components::SiemComponent;
-use usiem::events::field::SiemIp;
 use usiem::events::SiemLog;
 
+#[derive(Clone)]
 pub struct SyslogInput {
+    name : String,
     host: Cow<'static, str>,
     local_sender: Sender<SiemMessage>,
     local_receiver: Receiver<SiemMessage>,
     log_sender: Sender<SiemLog>,
     log_receiver: Receiver<SiemLog>,
     kernel_sender: Sender<SiemMessage>,
+    id: u64,
 }
 
 impl SiemComponent for SyslogInput {
-    fn name(&self) -> Cow<'static, str> {
-        Cow::Owned(format!("SyslogInput:{}", self.host))
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn set_log_channel(&mut self, sender: Sender<SiemLog>, receiver: Receiver<SiemLog>) {
@@ -44,11 +47,13 @@ impl SiemComponent for SyslogInput {
         return SiemComponentCapabilities::new(
             Cow::Borrowed("SyslogInput"),
             Cow::Borrowed("Syslog input"),
-            Vec::new(),
+            Cow::Borrowed(""),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
         );
     }
-
-    fn set_storage(&mut self, _conn: impl SiemComponentStateStorage) {}
 
     fn run(&mut self) {
         let listener = match TcpListener::bind(&self.host[..]) {
@@ -66,41 +71,28 @@ impl SiemComponent for SyslogInput {
         let local_receiver = self.local_receiver.clone();
         let log_sender = self.log_sender.clone();
         let kernel_sender = self.kernel_sender.clone();
+        let mut updater_counter = 0;
         loop {
             if !listen_spawner.load(Ordering::Relaxed) {
                 return;
             }
-            
-            let mut updater_counter = 0;
 
             match listener.accept() {
-                
                 Ok((mut stream, socket)) => {
                     let listen_spawner = Arc::clone(&listen);
                     Instant::update();
                     let log_sender = log_sender.clone();
-                    let kernel_sender = kernel_sender.clone();
+                    //This comp does not send info to the kernel
+                    let _kernel_sender = kernel_sender.clone();
                     thread::spawn(move || {
                         let mut buffer = [0; 9192];
-                        let origin = match SiemIp::from_ip_str(&socket.ip().to_string()[..]) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                //Error parsing?? notify kernel and end thread connection
-                                //kernel_sender.send()
-                                return;
-                            }
-                        };
+                        let origin = format!("{}", socket);
                         let mut last_string = String::with_capacity(4096);
                         loop {
                             let result = stream.read(&mut buffer);
                             let message_size = match result {
                                 Ok(message) => message,
-                                Err(error) => {
-                                    println!(
-                                        "Problem reading message {:?}: {:?}",
-                                        stream.peer_addr().unwrap().to_string(),
-                                        error
-                                    );
+                                Err(_error) => {
                                     return;
                                 }
                             };
@@ -128,28 +120,30 @@ impl SiemComponent for SyslogInput {
                                         break;
                                     }
                                 };
+                                let msg = (&last_string[last_pos..last_pos + pos]).to_string();
+                                let mut log = SiemLog::new(
+                                    msg,
+                                    Instant::recent().as_u64() as i64,
+                                    origin.clone(),
+                                );
                                 loop {
-                                    let log = SiemLog::new(
-                                        (&last_string[last_pos..last_pos + pos]).to_string(),
-                                        Instant::recent().as_u64() as i64,
-                                        origin.clone(),
-                                    );
+                                    //TODO: Parse syslog header
                                     match log_sender.send(log) {
                                         Ok(_) => {
                                             break;
                                         }
-                                        Err(_) => {}
+                                        Err(e) => {
+                                            log = e.0;
+                                        }
                                     }
                                 }
-
                                 last_pos += pos + 1;
                             }
                             if last_pos < last_string.len() {
                                 last_string = String::from(&last_string[last_pos..]);
-                            }else{
+                            } else {
                                 last_string = String::new();
                             }
-                            
                         }
                     });
                 }
@@ -163,8 +157,8 @@ impl SiemComponent for SyslogInput {
                             }
                             match local_receiver.try_recv() {
                                 Ok(msg) => match msg {
-                                    SiemMessage::Command(cmd) => match cmd {
-                                        SiemFunctionCall::STOP_COMPONENT(_) => {
+                                    SiemMessage::Command(_hdr, cmd) => match cmd {
+                                        SiemCommandCall::STOP_COMPONENT(_) => {
                                             println!("STOPPING COMPONENT");
                                             (*listen_spawner).store(false, Ordering::Relaxed);
                                             return;
@@ -180,7 +174,7 @@ impl SiemComponent for SyslogInput {
                         }
                         _ => {
                             println!("Error in connection");
-                            println!("{:?}",e);
+                            println!("{:?}", e);
                             // Notify kernel of error
                             //kernel_sender.send();
 
@@ -191,6 +185,22 @@ impl SiemComponent for SyslogInput {
             };
         }
     }
+
+    fn set_id(&mut self, id: u64) {
+        self.id = id;
+    }
+
+    fn duplicate(&self) -> Box<dyn SiemComponent> {
+        Box::new(self.clone())
+    }
+
+    fn set_datasets(&mut self, _datasets: Vec<usiem::components::dataset::SiemDataset>) {
+        //Not required
+    }
+
+    fn set_storage(&mut self, _conn: Box<dyn SiemComponentStateStorage>) {
+        //Not required
+    }
 }
 
 impl SyslogInput {
@@ -198,6 +208,7 @@ impl SyslogInput {
         let (local_sender, local_receiver) = crossbeam_channel::bounded(1000);
         let (log_sender, log_receiver) = crossbeam_channel::bounded(1000);
         let (kernel_sender, _kernel_receiver) = crossbeam_channel::bounded(1);
+        let name = format!("SyslogInput:{}", &host);
         SyslogInput {
             host,
             local_sender,
@@ -205,15 +216,19 @@ impl SyslogInput {
             log_sender,
             log_receiver,
             kernel_sender,
+            id: 0,
+            name
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use usiem::components::command::SiemCommandHeader;
+
     use super::*;
-    use std::thread;
     use std::io::Write;
+    use std::thread;
     #[test]
     fn test_syslog() {
         let mut sys_input = SyslogInput::new(Cow::Borrowed("localhost:13333"));
@@ -227,22 +242,32 @@ mod tests {
 
         thread::spawn(move || {
             thread::sleep(std::time::Duration::from_millis(1000));
-            let _sended = local_sender.send(SiemMessage::Command(SiemFunctionCall::STOP_COMPONENT(Cow::Borrowed("ComponentToStop"))));
+            let _sended = local_sender.send(SiemMessage::Command(
+                SiemCommandHeader {
+                    comm_id: 0,
+                    comp_id: 0,
+                    user: "KERNEL".to_string(),
+                },
+                SiemCommandCall::STOP_COMPONENT("ComponentToStop".to_string()),
+            ));
         });
         thread::sleep(std::time::Duration::from_millis(10));
-        
-        let mut stream = std::net::TcpStream::connect("localhost:13333").expect("Must connect to localhost");
-        let _writed =stream.write(b"This is the first log\nThis is the second log\n").expect("Must send logs");
+
+        let mut stream =
+            std::net::TcpStream::connect("localhost:13333").expect("Must connect to localhost");
+        let _writed = stream
+            .write(b"This is the first log\nThis is the second log\n")
+            .expect("Must send logs");
         match stream.flush() {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
-                println!("{}",e);
+                println!("{}", e);
             }
         };
         thread::sleep(std::time::Duration::from_millis(50));
         let log1 = log_receiver.recv().expect("Must receive first log");
-        assert_eq!(log1.message(),"This is the first log");
+        assert_eq!(log1.message(), "This is the first log");
         let log2 = log_receiver.recv().expect("Must receive second log");
-        assert_eq!(log2.message(),"This is the second log");
+        assert_eq!(log2.message(), "This is the second log");
     }
 }
