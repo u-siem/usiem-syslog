@@ -1,13 +1,13 @@
 [package]
 name = "u-siem-syslog"
-version = "0.0.3"
+version = "0.1.1"
 authors = ["Samuel Garcés <samuel.garces@protonmail.com>"]
 license = "MIT"
-description = "Windows Server DNS parser for uSIEM"
+description = "Syslog listener for uSIEM"
 repository = "https://github.com/u-siem/u-siem-core"
 keywords = ["SIEM", "security", "logs","syslog","dns"]
 categories = ["parsing"]
-edition = "2018"
+edition = "2021"
 
 [lib]
 name = "usiem_syslog"
@@ -15,7 +15,5 @@ path = "src/lib.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-u-siem = {version = "0.0"}
-chrono = "0.4"
-crossbeam-channel = { version = "0.5" }
+u-siem = {version = "0"}
 coarsetime = {version = "0.1.18" }
