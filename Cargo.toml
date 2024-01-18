@@ -9,11 +9,18 @@ keywords = ["SIEM", "security", "logs","syslog","dns"]
 categories = ["parsing"]
 edition = "2021"
 
+[features]
+default = ["metrics", "tls"]
+metrics = []
+tls = ["dep:rustls", "dep:rustls-pemfile"]
+
 [lib]
 name = "usiem_syslog"
 path = "src/lib.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-u-siem = {version = "0"}
+u-siem = {version = "0", path = "../u-siem-core"}
 coarsetime = {version = "0.1.18" }
+rustls = {version = "0.22.2", default_features = false, features = ["ring", "tls12"], optional = true }
+rustls-pemfile = { version = "2.0.0", optional = true }
