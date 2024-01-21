@@ -1,6 +1,5 @@
 use coarsetime::Instant;
 use usiem::crossbeam_channel::{self, Receiver, Sender};
-use usiem::{error, info};
 use usiem::prelude::{SiemComponentStateStorage, SiemError};
 use usiem::prelude::dataset::holder::DatasetHolder;
 use std::borrow::Cow;
@@ -16,6 +15,7 @@ use usiem::components::common::{
 use usiem::components::SiemComponent;
 use usiem::events::SiemLog;
 
+use crate::common::read_log;
 #[cfg(feature="metrics")]
 use crate::metrics::{SyslogMetrics, generate_syslog_input_metrics};
 #[cfg(feature="metrics")]
@@ -98,7 +98,7 @@ impl SiemComponent for SyslogInput {
                             }
                         }
                         _ => {
-                            info!("Error in connection: {:?}", e);
+                            usiem::debug!("Error listening for connections: {:?}", e);
                             return Ok(());
                         }
                     }
@@ -126,34 +126,8 @@ impl SiemComponent for SyslogInput {
                     continue
                 }
                 self.increase_received_bytes_metric(readed_bytes);
-                let mut splited_buf = buffer[0..readed_bytes].split_inclusive(|&v| v == b'\n');
-                loop {
-                    let partial_buffer = match splited_buf.next() {
-                        Some(v) => {
-                            if v.len() > 0 && v[v.len() - 1] == b'\n' {
-                               & v[0..v.len() - 1]
-                            }else {
-                                text_log.extend_from_slice(v);
-                                break;
-                            }
-                        },
-                        None => break
-                    };
-                    let log = if text_log.len() == 0 {
-                        SiemLog::new(String::from_utf8_lossy(&partial_buffer), Instant::recent().as_u64() as i64, "Syslog")
-                    }else {
-                        text_log.extend_from_slice(&partial_buffer);
-                        SiemLog::new(String::from_utf8_lossy(&text_log[0..text_log.len()]), Instant::recent().as_u64() as i64, "Syslog")
-                    };
-                    unsafe {
-                        text_log.set_len(0);
-                    }
-                    if let Err(err) = log_sender.send(log) {
-                        error!("Cannot process log: {}", usiem::serde_json::to_string(&err.0).unwrap_or_default());
-                        break;
-                    }
-                    self.increase_received_logs_metric();
-                }
+                let sent = read_log(&buffer[0..readed_bytes], &mut text_log, &log_sender);
+                self.increase_received_logs_metric_by(sent);
                 listeners.push_front((stream, text_log));
 
             };
@@ -192,7 +166,7 @@ impl SyslogInput {
             metrics : generate_syslog_input_metrics(name)
         }
     }
-    fn increase_received_logs_metric(&self) {
+    fn _increase_received_logs_metric(&self) {
         #[cfg(feature="metrics")]
         self.metrics.1.received_logs.inc();
     }
@@ -208,63 +182,27 @@ impl SyslogInput {
         #[cfg(feature="metrics")]
         self.metrics.1.active_connections.set(connections as f64);
     }
+    fn increase_received_logs_metric_by(&self, total : usize) {
+        #[cfg(feature="metrics")]
+        self.metrics.1.received_logs.inc_by(total as i64);
+    }
 }
 
 #[cfg(test)]
 mod tst {
-    use usiem::components::command::SiemCommandHeader;
     use super::*;
-    use std::io::Write;
     use std::thread;
     use crate::testing::*;
-
+    
     #[test]
-    fn syslog_component_should_receive_logs() {
-        let mut sys_input = SyslogInput::new(TCP_LISTENING_HOST, SYSLOG_COMPONENT_NAME);
-        let (log_sender, log_receiver) = crossbeam_channel::bounded(1000);
-        sys_input.set_log_channel(log_sender, log_receiver.clone());
-        let local_sender = sys_input.local_channel();
-        let capabilities = sys_input.capabilities();
-
-        thread::spawn(move || {
-            init_logging();
-            let _ = sys_input.run();
-        });
-
-        thread::spawn(move || {
-            thread::sleep(std::time::Duration::from_millis(1000));
-            let _sended = local_sender.send(SiemMessage::Command(
-                SiemCommandHeader {
-                    comm_id: 0,
-                    comp_id: 0,
-                    user: "KERNEL".to_string(),
-                },
-                SiemCommandCall::STOP_COMPONENT("ComponentToStop".to_string()),
-            ));
-        });
-        thread::sleep(std::time::Duration::from_millis(10));
-        let mut total_sent = 0;
-        let mut stream =
-            std::net::TcpStream::connect(TCP_LISTENING_HOST).expect("Must connect to localhost");
-        total_sent += stream
-            .write(b"This is the first log\nThis is the second log\nThis is the third log")
-            .expect("Must send logs");
-        stream.flush().unwrap();
-        thread::sleep(std::time::Duration::from_millis(500));// TODO: When standarized TCP KeepAlive for sockets add more than 1 second (Default in windows)
-        total_sent += stream
-            .write(b" with extra\n")
-            .expect("Must send logs");
-        stream.flush().unwrap();
-        thread::sleep(std::time::Duration::from_millis(200));
-        let log = log_receiver.recv().expect("Must receive first log");
-        assert_eq!(log.message(), "This is the first log");
-        let log = log_receiver.recv().expect("Must receive second log");
-        assert_eq!(log.message(), "This is the second log");
-        let log = log_receiver.recv().expect("Must receive second log");
-        assert_eq!(log.message(), "This is the third log with extra");
-        metrics_shold_match(capabilities.metrics(), 3, total_sent, 1, 1);
-        drop(stream);
+    fn tcp_syslog_basic_test() {
+        const TCP_LISTENING_HOST :&str = "127.0.0.1:23001";
+        let sys_input = SyslogInput::new(TCP_LISTENING_HOST, SYSLOG_COMPONENT_NAME);
+        let (capabilities, log_receiver) = prepare_syslog_basic_test(Box::new(sys_input));
+        let stream = std::net::TcpStream::connect(TCP_LISTENING_HOST).expect("Must connect to localhost");
         thread::sleep(std::time::Duration::from_millis(100));
-        metrics_shold_match(capabilities.metrics(), 3, total_sent, 1, 0);
+        syslog_basic_test(stream, &capabilities, &log_receiver);
+        thread::sleep(std::time::Duration::from_millis(100));
+        check_no_active_connections(&capabilities);
     }
 }

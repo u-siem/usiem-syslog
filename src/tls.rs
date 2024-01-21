@@ -6,12 +6,11 @@ use usiem::components::dataset::SiemDatasetType;
 use usiem::components::dataset::text_map::TextMapSynDataset;
 use usiem::components::storage::DummyStateStorage;
 use usiem::crossbeam_channel::{self, Receiver, Sender};
-use usiem::{error, info};
 use usiem::prelude::{SiemComponentStateStorage, SiemError};
 use usiem::prelude::dataset::holder::DatasetHolder;
 use std::borrow::Cow;
 use std::collections::LinkedList;
-use std::io::Read;
+use std::io::{Read, ErrorKind};
 use std::net::TcpListener;
 use std::sync::Arc;
 
@@ -83,7 +82,7 @@ impl SiemComponent for SyslogTlsInput {
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| error(e))?;
+            .map_err(error)?;
         let server_config = Arc::new(server_config);
         let listener = match TcpListener::bind(&self.host[..]) {
             Ok(v) => v,
@@ -124,7 +123,7 @@ impl SiemComponent for SyslogTlsInput {
                             }
                         }
                         _ => {
-                            info!("Error in connection: {:?}", e);
+                            usiem::info!("Error listening for connections: {:?}", e);
                             return Ok(());
                         }
                     }
@@ -137,6 +136,10 @@ impl SiemComponent for SyslogTlsInput {
                     None => break
                 };
                 if let Err(err) = acceptor.read_tls(&mut stream) {
+                    if let std::io::ErrorKind::WouldBlock = err.kind() {
+                        pending_connections.push_back((acceptor, stream));
+                        continue;
+                    }
                     usiem::debug!("Cannot accept TLS request: {:?}", err);
                     continue
                 }
@@ -167,31 +170,23 @@ impl SiemComponent for SyslogTlsInput {
                     Some(v) => v,
                     None => break
                 };
-                let readed = match connection.read_tls(&mut stream) {
-                    Ok(v) => {
-                        let _ = connection.process_new_packets();
-                        v
-                    },
+                let mut tls_stream = rustls::Stream::new(&mut connection, &mut stream); 
+                let readed = match tls_stream.read(&mut buffer) {
+                    Ok(v) => v,
                     Err(err) => {
-                        usiem::debug!("Cannot read from TLS stream: {:?}", err);
+                        if let ErrorKind::WouldBlock = err.kind() {
+                            accepted_connections.push_back((connection, stream, text_log));
+                            continue;
+                        }
                         continue
                     }
                 };
                 if readed == 0 {
-                    continue
+                    continue;
                 }
-                if let Err(err) = connection.reader().read_exact(&mut buffer[0..readed]) {
-                    usiem::debug!("Cannot read from TLS buffer: {:?}", err);
-                    continue
-                };
                 self.increase_received_bytes_metric(readed);
-                if let Some(log) = read_log(&buffer[0..readed], &mut text_log) {
-                    if let Err(err) = log_sender.send(log) {
-                        error!("Cannot process log: {}", usiem::serde_json::to_string(&err.0).unwrap_or_default());
-                        break;
-                    }
-                    self.increase_received_logs_metric();
-                }
+                let sent = read_log(&buffer[0..readed], &mut text_log, &log_sender);
+                self.increase_received_logs_metric_by(sent);
                 accepted_connections.push_back((connection, stream, text_log));
             } 
 
@@ -233,9 +228,13 @@ impl SyslogTlsInput {
             storage : Box::new(DummyStateStorage{})
         }
     }
-    fn increase_received_logs_metric(&self) {
+    fn _increase_received_logs_metric(&self) {
         #[cfg(feature="metrics")]
         self.metrics.1.received_logs.inc();
+    }
+    fn increase_received_logs_metric_by(&self, total : usize) {
+        #[cfg(feature="metrics")]
+        self.metrics.1.received_logs.inc_by(total as i64);
     }
     fn increase_total_connections_metric(&self) {
         #[cfg(feature="metrics")]
@@ -250,7 +249,7 @@ impl SyslogTlsInput {
         self.metrics.1.active_connections.set(connections as f64);
     }
     fn load_certs(&self, filename: &str) -> Result<Vec<CertificateDer<'static>>, SiemError> {
-        let file = self.storage.get_file(filename.into())?;
+        let file = self.storage.get_file(filename)?;
         match rustls_pemfile::read_one_from_slice(&file) {
             Ok(Some(v)) => match v.0 {
                 rustls_pemfile::Item::X509Certificate(cert) => Ok(vec![cert]),
@@ -263,7 +262,7 @@ impl SyslogTlsInput {
     
     /// Loads the server private key from a file
     fn load_private_key(&self, filename: &str) -> Result<PrivateKeyDer<'static>, SiemError> {
-        let file = self.storage.get_file(filename.into())?;
+        let file = self.storage.get_file(filename)?;
         match rustls_pemfile::read_one_from_slice(&file) {
             Ok(Some(v)) => match v.0 {
                 rustls_pemfile::Item::Pkcs1Key(key) => Ok(key.into()),
@@ -295,61 +294,21 @@ fn error(err: rustls::Error) -> SiemError {
 
 #[cfg(test)]
 mod tst {
-    use usiem::components::command::SiemCommandHeader;
+
     use super::*;
-    use std::io::Write;
     use std::thread;
     use crate::testing::*;
 
     #[test]
-    fn syslog_component_should_receive_logs() {
-        let mut sys_input = SyslogTlsInput::new(TLS_LISTENING_HOST, SYSLOG_COMPONENT_NAME);
-        let (log_sender, log_receiver) = crossbeam_channel::bounded(1000);
-        sys_input.set_log_channel(log_sender, log_receiver.clone());
-        sys_input.set_datasets(testing_datasets());
-        sys_input.set_storage(testing_storage());
-        let local_sender = sys_input.local_channel();
-        let capabilities = sys_input.capabilities();
-
-        thread::spawn(move || {
-            init_logging();
-            let _ = sys_input.run().unwrap();
-        });
-
-        thread::spawn(move || {
-            thread::sleep(std::time::Duration::from_millis(1000));
-            let _sended = local_sender.send(SiemMessage::Command(
-                SiemCommandHeader {
-                    comm_id: 0,
-                    comp_id: 0,
-                    user: "KERNEL".to_string(),
-                },
-                SiemCommandCall::STOP_COMPONENT("ComponentToStop".to_string()),
-            ));
-        });
-        thread::sleep(std::time::Duration::from_millis(10));
-        let mut total_sent = 0;
-        let mut stream =
-            std::net::TcpStream::connect(TLS_LISTENING_HOST).expect("Must connect to localhost");
-        total_sent += stream
-            .write(b"This is the first log\nThis is the second log\nThis is the third log")
-            .expect("Must send logs");
-        stream.flush().unwrap();
-        thread::sleep(std::time::Duration::from_millis(500));// TODO: When standarized TCP KeepAlive for sockets add more than 1 second (Default in windows)
-        total_sent += stream
-            .write(b" with extra\n")
-            .expect("Must send logs");
-        stream.flush().unwrap();
-        thread::sleep(std::time::Duration::from_millis(200));
-        let log = log_receiver.recv().expect("Must receive first log");
-        assert_eq!(log.message(), "This is the first log");
-        let log = log_receiver.recv().expect("Must receive second log");
-        assert_eq!(log.message(), "This is the second log");
-        let log = log_receiver.recv().expect("Must receive second log");
-        assert_eq!(log.message(), "This is the third log with extra");
-        metrics_shold_match(capabilities.metrics(), 3, total_sent, 1, 1);
-        drop(stream);
+    fn tls_syslog_basic_test() {
+        let sys_input = SyslogTlsInput::new(TLS_LISTENING_HOST, SYSLOG_COMPONENT_NAME);
+        let (capabilities, log_receiver) = prepare_syslog_basic_test(Box::new(sys_input));
+        let mut client = testing_tls_client();
+        let stream = client.stream();
         thread::sleep(std::time::Duration::from_millis(100));
-        metrics_shold_match(capabilities.metrics(), 3, total_sent, 1, 0);
+        syslog_basic_test(stream, &capabilities, &log_receiver);
+        drop(client);
+        thread::sleep(std::time::Duration::from_millis(100));
+        check_no_active_connections(&capabilities);
     }
 }

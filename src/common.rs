@@ -1,35 +1,34 @@
 use coarsetime::Instant;
-use usiem::{events::SiemLog, chrono::Datelike};
+use usiem::{events::SiemLog, chrono::Datelike, crossbeam_channel::Sender};
 
 
-pub fn read_log(buffer : &[u8], text_log : &mut Vec<u8>) -> Option<SiemLog> {
+pub fn read_log(buffer : &[u8], text_log : &mut Vec<u8>,sender : &Sender<SiemLog>) -> usize {
     let mut splited_buf = buffer.split_inclusive(|&v| v == b'\n');
-    loop {
-        let partial_buffer = match splited_buf.next() {
-            Some(v) => {
-                if v.len() > 0 && v[v.len() - 1] == b'\n' {
-                    & v[0..v.len() - 1]
-                }else {
-                    text_log.extend_from_slice(v);
-                    break;
-                }
-            },
-            None => break
+    let mut sent = 0;
+    while let Some(v) = splited_buf.next() {
+        let partial_buffer = if !v.is_empty() && v[v.len() - 1] == b'\n' {
+            & v[0..v.len() - 1]
+        }else {
+            text_log.extend_from_slice(v);
+            break;
         };
-        let log = if text_log.len() == 0 {
+        let log = if text_log.is_empty() {
             SiemLog::new(String::from_utf8_lossy(&partial_buffer), Instant::recent().as_u64() as i64, "Syslog")
         }else {
-            text_log.extend_from_slice(&partial_buffer);
-            SiemLog::new(String::from_utf8_lossy(&text_log[0..text_log.len()]), Instant::recent().as_u64() as i64, "Syslog")
+            text_log.extend(partial_buffer.iter());
+            let log = SiemLog::new(String::from_utf8_lossy(&text_log[0..text_log.len()]), Instant::recent().as_u64() as i64, "Syslog");
+            text_log.truncate(0);
+            log
         };
-        unsafe {
-            text_log.set_len(0);
+        if let Err(err) = sender.send(log) {
+            usiem::warn!("Error sending log: {}", usiem::serde_json::to_string(&err.0).unwrap_or_default());
+            break
         }
-        return Some(log)
+        sent += 1;
     }
-    None
+    sent
 }
-
+#[allow(dead_code)]
 pub fn parse_log(txt : &[u8]) -> SiemLog {
     let content = String::from_utf8_lossy(txt);
     let (created, origin) = match parse_header(&content) {
@@ -41,9 +40,9 @@ pub fn parse_log(txt : &[u8]) -> SiemLog {
     log.set_event_created(created);
     log
 }
-
+#[allow(dead_code)]
 fn parse_header(txt : &str) -> Option<(i64, &str)> {
-    let pri_end = match txt[0..5].find(">") {
+    let pri_end = match txt[0..5].find('>') {
         Some(pos) => pos + 1,
         None => 0
     };
@@ -59,7 +58,7 @@ fn parse_header(txt : &str) -> Option<(i64, &str)> {
         }, // version
         Err(_) => {
             let day = split.next()?;
-            let day = if day == "" {
+            let day = if day.is_empty() {
                 split.next()?
             }else {
                 day
