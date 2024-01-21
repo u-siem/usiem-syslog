@@ -1,6 +1,6 @@
 [package]
 name = "u-siem-syslog"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Samuel Garcés <samuel.garces@protonmail.com>"]
 license = "MIT"
 description = "Syslog listener for uSIEM"
